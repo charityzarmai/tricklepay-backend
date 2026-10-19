@@ -134,6 +134,44 @@ function validateContractId(contractId: string): void {
   }
 }
 
+// Validates connection pool settings in the DATABASE_URL if present. Prisma reads
+// connection_limit and pool_timeout from query parameters, so invalid values surface
+// as runtime failures. Validating them at startup catches misconfigurations early.
+function validateDatabaseUrl(url: string): void {
+  try {
+    const parsed = new URL(url);
+    const connectionLimit = parsed.searchParams.get("connection_limit");
+    const poolTimeout = parsed.searchParams.get("pool_timeout");
+
+    if (connectionLimit !== null) {
+      const limit = Number(connectionLimit);
+      if (!Number.isInteger(limit) || limit < 1) {
+        throw new Error(
+          `DATABASE_URL connection_limit must be a positive integer, got "${connectionLimit}". ` +
+            `Example: postgresql://user:pass@host:5432/db?connection_limit=10&pool_timeout=10`,
+        );
+      }
+    }
+
+    if (poolTimeout !== null) {
+      const timeout = Number(poolTimeout);
+      if (!Number.isInteger(timeout) || timeout < 1) {
+        throw new Error(
+          `DATABASE_URL pool_timeout must be a positive integer (seconds), got "${poolTimeout}". ` +
+            `Example: postgresql://user:pass@host:5432/db?connection_limit=10&pool_timeout=10`,
+        );
+      }
+    }
+  } catch (err) {
+    // Re-throw validation errors as-is
+    if (err instanceof Error && err.message.startsWith("DATABASE_URL")) {
+      throw err;
+    }
+    // URL parsing failures surface as-is; invalid schemes or malformed URLs
+    // will fail when Prisma tries to connect anyway.
+  }
+}
+
 // Rejects a configured start ledger that is beyond the current chain head.
 // Such a value would leave the indexer waiting forever with no events, which
 // looks identical to a broken RPC endpoint, so it is rejected at startup with
@@ -180,6 +218,9 @@ export function loadConfig(): Config {
   const contractId = required("STREAM_CONTRACT_ID");
   validateContractId(contractId);
 
+  const databaseUrl = required("DATABASE_URL");
+  validateDatabaseUrl(databaseUrl);
+
   const rateLimitMax = integer("RATE_LIMIT_MAX", DEFAULT_RATE_LIMIT_MAX);
   if (rateLimitMax === 0) {
     throw new Error("RATE_LIMIT_MAX must be greater than zero");
@@ -192,7 +233,7 @@ export function loadConfig(): Config {
   return {
     port: integer("PORT", 3000),
     host: optional("HOST", "0.0.0.0"),
-    databaseUrl: required("DATABASE_URL"),
+    databaseUrl,
     network,
     networkPassphrase,
     rpcUrl,
