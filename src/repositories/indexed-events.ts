@@ -32,10 +32,19 @@ export interface IndexedEventRecord {
   closedAt: bigint | null;
 }
 
-export async function listIndexedEvents(streamId: bigint): Promise<IndexedEventRecord[]> {
+export async function listIndexedEvents(
+  streamId: bigint,
+  kind?: IndexedEventKind,
+): Promise<IndexedEventRecord[]> {
+  const where: { streamId: string; kind?: IndexedEventKind } = {
+    streamId: streamId.toString(),
+  };
+  if (kind !== undefined) {
+    where.kind = kind;
+  }
   const rows = await withQueryTimeout(
     (prisma as any).indexedEvent.findMany({
-      where: { streamId: streamId.toString() },
+      where,
       orderBy: { eventId: "asc" },
     }),
   );

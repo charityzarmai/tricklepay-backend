@@ -73,6 +73,7 @@ export interface StreamFilter {
   recipient?: string;
   token?: string;
   cancelled?: boolean;
+  status?: "pending" | "streaming" | "completed" | "cancelled";
   cursor?: bigint;
   limit?: number;
   offset?: number;
@@ -264,13 +265,36 @@ export async function getStream({ streamId }: { streamId: bigint }): Promise<Str
 
 // Repository naming convention: use `get` for one record, `list` for
 // collections, `count` for totals, and action verbs for mutations.
-function whereFromFilter(filter: StreamFilter): Prisma.StreamWhereInput {
+
+// The database-side predicate for each lifecycle status, mirroring the summary
+// endpoint logic. Used for both filtering and aggregation.
+function statusWhereFilter(status: "pending" | "streaming" | "completed" | "cancelled", now: bigint): Prisma.StreamWhereInput {
+  switch (status) {
+    case "cancelled":
+      return { cancelled: true };
+    case "pending":
+      return { cancelled: false, startTime: { gt: now } };
+    case "completed":
+      return { cancelled: false, endTime: { lte: now } };
+    case "streaming":
+      return { cancelled: false, startTime: { lte: now }, endTime: { gt: now } };
+  }
+}
+
+function whereFromFilter(filter: StreamFilter, now?: bigint): Prisma.StreamWhereInput {
   const where: Prisma.StreamWhereInput = {};
   if (filter.sender) where.sender = filter.sender;
   if (filter.recipient) where.recipient = filter.recipient;
   if (filter.token) where.token = filter.token;
   if (filter.cancelled !== undefined) where.cancelled = filter.cancelled;
   if (filter.cursor !== undefined) where.streamId = { lt: filter.cursor };
+  
+  // Apply status filter using the same predicates as the summary endpoint
+  if (filter.status && now !== undefined) {
+    const statusFilter = statusWhereFilter(filter.status, now);
+    Object.assign(where, statusFilter);
+  }
+  
   return where;
 }
 
@@ -285,6 +309,24 @@ export function orderByFromFilter(
   return orderBy;
 }
 
+export type StreamStatus = "pending" | "streaming" | "completed" | "cancelled";
+
+// The database-side predicate for each lifecycle status, mirroring `statusOf`
+// in src/lib/stream-view.ts: cancelled wins first, then the start/end time
+// windows against the clock.
+export function statusWhere(status: StreamStatus, now: bigint): Prisma.StreamWhereInput {
+  switch (status) {
+    case "cancelled":
+      return { cancelled: true };
+    case "pending":
+      return { cancelled: false, startTime: { gt: now } };
+    case "completed":
+      return { cancelled: false, endTime: { lte: now } };
+    case "streaming":
+      return { cancelled: false, startTime: { lte: now }, endTime: { gt: now } };
+  }
+}
+
 export async function listStreams(filter: StreamFilter): Promise<StreamListResult> {
   const limit = filter.limit ?? 50;
   const useCursor = filter.cursor !== undefined;
@@ -293,7 +335,7 @@ export async function listStreams(filter: StreamFilter): Promise<StreamListResul
 
   const rows = await withQueryTimeout(
     prisma.stream.findMany({
-      where: whereFromFilter(filter),
+      where: whereFromFilter(filter, now),
       orderBy: orderByFromFilter(filter),
       take,
       skip,
@@ -311,8 +353,8 @@ export async function listStreams(filter: StreamFilter): Promise<StreamListResul
 
 // Total number of streams matching the filter, ignoring limit and offset, so a
 // client can tell how many pages exist.
-export async function countStreams(filter: StreamFilter): Promise<number> {
-  return withQueryTimeout(prisma.stream.count({ where: whereFromFilter(filter) }));
+export async function countStreams(filter: StreamFilter, now?: bigint): Promise<number> {
+  return withQueryTimeout(prisma.stream.count({ where: whereFromFilter(filter, now) }));
 }
 
 export interface StreamAggregate {
@@ -339,3 +381,42 @@ export async function aggregateStreams(where: Prisma.StreamWhereInput): Promise<
     withdrawn: result._sum.withdrawn ?? new Prisma.Decimal(0),
   };
 }
+
+export interface TokenSummary {
+  token: string;
+  count: number;
+  total: string;
+}
+
+// Groups streams by token and returns the distinct tokens with stream count
+// and total escrowed amount. The sums run in Postgres over decimal columns so
+// amounts stay exact.
+export async function listTokens(): Promise<TokenSummary[]> {
+  const groups = await withQueryTimeout(
+    prisma.stream.groupBy({
+      by: ["token"],
+      _count: { streamId: true },
+      _sum: { totalAmount: true },
+      orderBy: { token: "asc" },
+    }),
+  );
+
+  return groups.map((group) => ({
+    token: group.token,
+    count: group._count.streamId,
+    total: group._sum.totalAmount ? group._sum.totalAmount.toString() : "0",
+  }));
+}
+
+// Returns incoming (recipient = address) and outgoing (sender = address) streams
+// for a single Stellar account or contract address.
+export async function getAccountStreams(
+  address: string,
+): Promise<{ incoming: Stream[]; outgoing: Stream[] }> {
+  const [incoming, outgoing] = await Promise.all([
+    withQueryTimeout(prisma.stream.findMany({ where: { recipient: address } })),
+    withQueryTimeout(prisma.stream.findMany({ where: { sender: address } })),
+  ]);
+  return { incoming, outgoing };
+}
+
